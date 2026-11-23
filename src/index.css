@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    background-color: #111318;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+}
+
+/* Classic pixelated voxel button bevels */
+.mc-panel {
+  background-color: #c6c6c6;
+  border-top: 3px solid #ffffff;
+  border-left: 3px solid #ffffff;
+  border-right: 3px solid #555555;
+  border-bottom: 3px solid #555555;
+  box-shadow: 0 0 0 2px #1a1a1a;
+}
+
+.mc-slot {
+  background-color: #8b8b8b;
+  border-top: 2px solid #373737;
+  border-left: 2px solid #373737;
+  border-right: 2px solid #ffffff;
+  border-bottom: 2px solid #ffffff;
+}
+
+.mc-slot-active {
+  background-color: #a8a8a8;
+  border-top: 3px solid #ffffff;
+  border-left: 3px solid #ffffff;
+  border-right: 3px solid #ffffff;
+  border-bottom: 3px solid #ffffff;
+  box-shadow: 0 0 0 2px #1a1a1a, inset 0 0 0 2px #373737;
+}
+
+.mc-btn {
+  background-color: #727272;
+  border-top: 3px solid #a8a8a8;
+  border-left: 3px solid #a8a8a8;
+  border-right: 3px solid #3c3c3c;
+  border-bottom: 3px solid #3c3c3c;
+  box-shadow: 0 0 0 2px #141414;
+  color: #ffffff;
+  text-shadow: 2px 2px 0 #2b2b2b;
+  transition: transform 80ms ease, background-color 80ms ease;
+}
+
+.mc-btn:hover {
+  background-color: #8496c4;
+  border-top-color: #b8c6ea;
+  border-left-color: #b8c6ea;
+  border-right-color: #465378;
+  border-bottom-color: #465378;
+}
+
+.mc-btn:active {
+  transform: translateY(1px);
+}
+
+.mc-btn-green {
+  background-color: #3b8526;
+  border-top: 3px solid #6cc349;
+  border-left: 3px solid #6cc349;
+  border-right: 3px solid #215114;
+  border-bottom: 3px solid #215114;
+  box-shadow: 0 0 0 2px #11220c;
+  color: #ffffff;
+  text-shadow: 2px 2px 0 #1b3e11;
+}
+
+.mc-btn-green:hover {
+  background-color: #499f30;
+  border-top-color: #82db5f;
+  border-left-color: #82db5f;
+}
+
+.pixelated {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}

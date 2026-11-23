@@ -1,0 +1,6 @@
+{
+  "name": "BlockCraft 3D",
+  "description": "Ein 3D-Voxel-Sandbox-Spiel im Minecraft-Stil mit prozeduraler Welt, Tag-Nacht-Zyklus, Bauen, Abbauen, Crafting und Mobs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
