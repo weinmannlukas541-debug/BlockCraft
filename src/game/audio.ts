@@ -8,10 +8,11 @@ class SoundEngine {
   private ensureContext(): AudioContext | null {
     if (this.muted) return null;
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return null;
       this.ctx = new AudioCtx();
-      // Pre-build 1 second white noise buffer
       const sr = this.ctx.sampleRate;
       const buf = this.ctx.createBuffer(1, sr, sr);
       const data = buf.getChannelData(0);
@@ -77,7 +78,7 @@ class SoundEngine {
     const gain = ctx.createGain();
     osc.type = type;
     osc.frequency.setValueAtTime(startFreq, now);
-    osc.frequency.exponentialRampToValueAtTime(Math.max(40, endFreq), now + duration);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(30, endFreq), now + duration);
 
     gain.gain.setValueAtTime(0.001, now);
     gain.gain.linearRampToValueAtTime(gainPeak, now + 0.008);
@@ -108,6 +109,9 @@ class SoundEngine {
         break;
       case 'water':
         this.playFilteredNoise('bandpass', 900 * jitter, 2.5, 0.12, 0.08, 1.5);
+        break;
+      case 'lava':
+        this.playFilteredNoise('lowpass', 420 * jitter, 2.0, 0.14, 0.08, 0.6);
         break;
       default:
         this.playTone('square', 230 * jitter, 110, 0.045, 0.04);
@@ -169,26 +173,90 @@ class SoundEngine {
     this.playFilteredNoise('lowpass', 600, 1.0, 0.12, 0.12);
   }
 
+  playShieldBlock() {
+    this.playTone('triangle', 420, 180, 0.12, 0.16);
+    this.playFilteredNoise('bandpass', 2400, 2.0, 0.09, 0.12);
+  }
+
+  playBowShoot() {
+    this.playTone('triangle', 460, 160, 0.12, 0.11);
+    this.playFilteredNoise('highpass', 1600, 1.5, 0.08, 0.07);
+  }
+
   playExplode() {
     this.playTone('sawtooth', 110, 28, 0.55, 0.25);
     this.playFilteredNoise('lowpass', 420, 0.8, 0.65, 0.3, 0.25);
+  }
+
+  playThunder() {
+    this.playTone('sawtooth', 85, 32, 0.9, 0.18);
+    this.playFilteredNoise('lowpass', 300, 0.7, 1.2, 0.24, 0.35);
   }
 
   playSplash() {
     this.playFilteredNoise('bandpass', 780, 1.8, 0.22, 0.14, 1.6);
   }
 
+  playSizzle() {
+    this.playFilteredNoise('highpass', 2600, 1.2, 0.2, 0.1);
+  }
+
   playClick() {
     this.playTone('square', 640, 480, 0.035, 0.05);
   }
 
-  playMob(kind: 'pig' | 'sheep' | 'creeper_hiss') {
-    if (kind === 'pig') {
-      this.playTone('sawtooth', 260, 190, 0.14, 0.06);
-    } else if (kind === 'sheep') {
-      this.playTone('triangle', 380, 320, 0.22, 0.06);
-    } else {
-      this.playFilteredNoise('highpass', 2400, 2.5, 0.45, 0.14, 1.3);
+  playMob(
+    kind:
+      | 'pig'
+      | 'sheep'
+      | 'cow'
+      | 'chicken'
+      | 'horse'
+      | 'cat'
+      | 'dog'
+      | 'zombie'
+      | 'skeleton'
+      | 'spider'
+      | 'creeper_hiss'
+      | 'enderman',
+  ) {
+    switch (kind) {
+      case 'pig':
+        this.playTone('sawtooth', 260, 190, 0.14, 0.06);
+        break;
+      case 'sheep':
+        this.playTone('triangle', 380, 320, 0.22, 0.06);
+        break;
+      case 'cow':
+        this.playTone('sawtooth', 145, 110, 0.32, 0.07);
+        break;
+      case 'chicken':
+        this.playTone('sine', 780, 960, 0.08, 0.05);
+        break;
+      case 'horse':
+        this.playTone('triangle', 480, 290, 0.26, 0.06);
+        break;
+      case 'cat':
+        this.playTone('sine', 640, 820, 0.18, 0.05);
+        break;
+      case 'dog':
+        this.playTone('triangle', 320, 460, 0.12, 0.07);
+        break;
+      case 'zombie':
+        this.playTone('sawtooth', 120, 82, 0.3, 0.09);
+        break;
+      case 'skeleton':
+        this.playFilteredNoise('bandpass', 2800, 4.0, 0.09, 0.08);
+        break;
+      case 'spider':
+        this.playFilteredNoise('highpass', 2100, 2.5, 0.14, 0.08, 0.7);
+        break;
+      case 'creeper_hiss':
+        this.playFilteredNoise('highpass', 2400, 2.5, 0.45, 0.14, 1.3);
+        break;
+      case 'enderman':
+        this.playTone('sine', 210, 520, 0.28, 0.08);
+        break;
     }
   }
 }

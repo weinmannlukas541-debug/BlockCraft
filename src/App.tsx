@@ -4,12 +4,13 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { ChestModal, FurnaceModal } from './components/ContainerModals';
 import { GameHud } from './components/GameHud';
 import { InventoryModal } from './components/InventoryModal';
 import { GameOverModal, PauseModal, TitleScreen } from './components/TitleAndPauseModals';
 import { TouchControls } from './components/TouchControls';
 import { VoxelEngine } from './game/engine';
-import { HudSnapshot } from './game/types';
+import { HudSnapshot, ItemId } from './game/types';
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
@@ -35,6 +36,8 @@ export default function App() {
   }, []);
 
   const engine = engineRef.current;
+  const heldItem = hud ? hud.hotbar[hud.selectedSlot] : null;
+  const hasShield = Boolean(hud?.offhand?.id === ItemId.Shield || heldItem?.id === ItemId.Shield);
 
   return (
     <div className="relative h-dvh w-screen overflow-hidden bg-[#111318]">
@@ -43,8 +46,14 @@ export default function App() {
 
       {hud?.screen === 'title' && (
         <TitleScreen
-          isTouch={hud.touchControls}
+          hud={hud}
           onStart={(mode) => engine?.startGame(mode)}
+          onListWorlds={() => engine?.getWorldList() ?? Promise.resolve([])}
+          onCreateWorld={(opts) => engine?.createNewWorld(opts) ?? Promise.resolve()}
+          onLoadWorld={(id) => engine?.loadWorldById(id) ?? Promise.resolve(false)}
+          onDeleteWorld={(id) => engine?.deleteWorldById(id) ?? Promise.resolve()}
+          onUpdateSettings={(partial) => engine?.updateSettings(partial)}
+          onToggleFullscreen={() => engine?.toggleFullscreen()}
         />
       )}
 
@@ -56,19 +65,22 @@ export default function App() {
             onSelectSlot={(idx) => engine?.selectHotbarSlot(idx)}
             onToggleMute={() => engine?.toggleMute()}
             onToggleTouch={() => engine?.toggleTouchControls()}
+            onToggleFullscreen={() => engine?.toggleFullscreen()}
             onOpenInventory={() => engine?.openScreen('inventory')}
             onPause={() => engine?.openScreen('paused')}
           />
 
-          {hud.touchControls && (
+          {hud.settings.touchControls && (
             <TouchControls
               isFlying={hud.isFlying}
+              hasShield={hasShield}
               onMove={(x, y) => engine?.setTouchMove(x, y)}
               onJump={(held) => engine?.setTouchJump(held)}
               onDescend={(held) => engine?.setTouchDescend(held)}
               onToggleSneak={() => engine?.toggleTouchSneak()}
               onMine={(held) => engine?.setTouchMine(held)}
               onPlace={() => engine?.triggerTouchPlace()}
+              onBlock={(held) => engine?.setTouchBlock(held)}
             />
           )}
         </>
@@ -82,6 +94,29 @@ export default function App() {
           onClose={() => engine?.resumeGame()}
           onSetSlot={(area, idx, stack) => engine?.setSlotItem(area, idx, stack)}
           onGiveCreative={(itemId) => engine?.giveCreativeItem(itemId)}
+          onDropStack={(stack) => engine?.dropStackFromUi(stack)}
+        />
+      )}
+
+      {hud && hud.screen === 'furnace' && (
+        <FurnaceModal
+          hud={hud}
+          itemIcons={itemIcons}
+          onClose={() => engine?.resumeGame()}
+          onSetSlot={(area, idx, stack) => engine?.setSlotItem(area, idx, stack)}
+          onSetFurnaceSlot={(slot, stack) => engine?.setFurnaceSlot(slot, stack)}
+          onDropStack={(stack) => engine?.dropStackFromUi(stack)}
+        />
+      )}
+
+      {hud && hud.screen === 'chest' && (
+        <ChestModal
+          hud={hud}
+          itemIcons={itemIcons}
+          onClose={() => engine?.resumeGame()}
+          onSetSlot={(area, idx, stack) => engine?.setSlotItem(area, idx, stack)}
+          onSetChestSlot={(idx, stack) => engine?.setChestSlot(idx, stack)}
+          onDropStack={(stack) => engine?.dropStackFromUi(stack)}
         />
       )}
 
@@ -89,12 +124,14 @@ export default function App() {
         <PauseModal
           hud={hud}
           onResume={() => engine?.resumeGame()}
-          onToggleMode={() =>
-            engine?.setGameMode(hud.gameMode === 'survival' ? 'creative' : 'survival')
-          }
+          onSaveWorld={() => void engine?.saveCurrentWorld(true)}
+          onSetMode={(m) => engine?.setGameMode(m)}
           onToggleTouch={() => engine?.toggleTouchControls()}
+          onToggleFullscreen={() => engine?.toggleFullscreen()}
           onSetTime={(t) => engine?.setTimePreset(t)}
+          onSetWeather={(w) => engine?.setWeather(w)}
           onToggleMute={() => engine?.toggleMute()}
+          onUpdateSettings={(partial) => engine?.updateSettings(partial)}
           onNewWorld={() => engine?.regenerateWorld()}
           onTitle={() => engine?.openScreen('title')}
         />
@@ -102,6 +139,7 @@ export default function App() {
 
       {hud?.screen === 'gameover' && (
         <GameOverModal
+          keepInventory={hud.keepInventory}
           onRespawn={() => engine?.respawnPlayer()}
           onTitle={() => engine?.openScreen('title')}
         />

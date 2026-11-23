@@ -1,18 +1,43 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { soundEngine } from './audio';
-import { BLOCKS, ITEMS } from './blocks';
-import { DropManager, MobManager, ParticlePool } from './entities';
+import { BLOCKS, ITEMS, SMELT_RECIPES, getFuelBurnTime } from './blocks';
+import {
+  DropManager,
+  FootprintPool,
+  MobManager,
+  ParticlePool,
+  ProjectileManager,
+} from './entities';
 import { SkyEnvironment } from './sky';
+import {
+  WorldSavePayload,
+  createWorldId,
+  deleteWorldFromDB,
+  listWorldMetasFromDB,
+  loadSettings,
+  loadWorldFromDB,
+  saveSettings,
+  saveWorldToDB,
+} from './storage';
 import { createVoxelTextures, GeneratedTextures } from './textures';
-import { BlockId, GameMode, GameScreen, HudSnapshot, ItemId, ItemStack } from './types';
+import {
+  BlockId,
+  FurnaceState,
+  GameMode,
+  GameScreen,
+  GameSettings,
+  HudSnapshot,
+  ItemId,
+  ItemStack,
+  WeatherType,
+  WorldSaveMeta,
+} from './types';
 import { RaycastHit, SEA_LEVEL, VoxelWorld, WORLD_HEIGHT } from './world';
 
 const _vec3A = new THREE.Vector3();
-const _vec3B = new THREE.Vector3();
 const _lookDir = new THREE.Vector3();
 
-const RENDER_RADIUS = 3; // 7x7 chunks (112x112 blocks active)
 const PLAYER_RADIUS = 0.28;
 const PLAYER_HEIGHT = 1.78;
 const EYE_HEIGHT = 1.58;
@@ -27,18 +52,22 @@ export class VoxelEngine {
   private textures: GeneratedTextures;
   private opaqueMat: THREE.MeshStandardMaterial;
   private waterMat: THREE.MeshStandardMaterial;
+  private waterUniforms = { uTime: { value: 0 } };
   private worldGroup = new THREE.Group();
   private world: VoxelWorld;
   private sky: SkyEnvironment;
   private particles: ParticlePool;
+  private footprints: FootprintPool;
   private drops: DropManager;
+  private projectiles: ProjectileManager;
   private mobs: MobManager;
 
-  // Dynamic glowstone point light
+  // Dynamic light near torches, lanterns, glowstones, lava
   private glowLight: THREE.PointLight;
 
-  // Selection outline & crack overlay
+  // Selection outline, placement preview ghost, and crack overlay
   private selectBox: THREE.LineSegments;
+  private previewGroup: THREE.Group;
   private crackMesh: THREE.Mesh;
   private crackMats: THREE.MeshBasicMaterial[];
 
@@ -51,15 +80,28 @@ export class VoxelEngine {
   // Pending TNT fuses
   private tntFuses: { x: number; y: number; z: number; timer: number }[] = [];
 
-  // Simulation state
+  // Containers (Furnaces & Chests)
+  private furnaces = new Map<string, FurnaceState>();
+  private chests = new Map<string, (ItemStack | null)[]>();
+  private activeFurnaceKey: string | null = null;
+  private activeChestKey: string | null = null;
+
+  // Settings & World Metadata
+  private settings: GameSettings = loadSettings();
+  private worldId = createWorldId();
+  private worldName = 'Meine Voxel-Welt';
+  private keepInventory = false;
   private screen: GameScreen = 'title';
   private gameMode: GameMode = 'survival';
   private seed = 42197;
-  private timeOfDay = 0.23; // Start at crisp morning-noon sun
+  private timeOfDay = 0.22;
   private dayCount = 1;
+  private weather: WeatherType = 'clear';
+  private weatherTimer = 140;
 
   // Player state
   private playerPos = new THREE.Vector3(8.5, 22, 8.5);
+  private spawnPoint = new THREE.Vector3(8.5, 22, 8.5);
   private playerVel = new THREE.Vector3();
   private yaw = 0.4;
   private pitch = -0.1;
@@ -73,6 +115,7 @@ export class VoxelEngine {
   private isUnderwater = false;
   private walkBob = 0;
   private stepDist = 0;
+  private leftFootNext = true;
   private cameraShake = 0;
   private hitstopTimer = 0;
   private titleAngle = 0;
@@ -81,29 +124,32 @@ export class VoxelEngine {
   private health = 20;
   private maxHealth = 20;
   private hunger = 20;
+  private air = 20;
+  private airTimer = 0;
+  private lavaTimer = 0;
   private hungerTimer = 0;
   private xpLevel = 1;
   private xpProgress = 0.15;
 
-  // Inventory (9 hotbar + 27 main)
+  // Inventory (9 hotbar + 27 bag + 4 armor + offhand shield)
   private hotbar: (ItemStack | null)[] = new Array(9).fill(null);
   private inventory: (ItemStack | null)[] = new Array(27).fill(null);
+  private armor: (ItemStack | null)[] = new Array(4).fill(null);
+  private offhand: ItemStack | null = null;
   private selectedSlot = 0;
   private showDebug = false;
+  private statusToast: string | null = null;
+  private statusToastTimer = 0;
 
   // Input state
   private keys = new Set<string>();
   private mouseLeftDown = false;
   private mouseRightDown = false;
+  private touchBlockHeld = false;
   private attackCooldown = 0;
   private placeCooldown = 0;
 
   // Touch / Mobile controls
-  private touchControls: boolean =
-    typeof window !== 'undefined' &&
-    ('ontouchstart' in window ||
-      navigator.maxTouchPoints > 0 ||
-      window.matchMedia?.('(pointer: coarse)').matches === true);
   private touchMoveX = 0;
   private touchMoveY = 0;
   private touchJumpHeld = false;
@@ -123,10 +169,15 @@ export class VoxelEngine {
   private digSoundTimer = 0;
   private currentHit: RaycastHit | null = null;
 
-  // Loop & callbacks
+  // Loop, Auto-save, FPS & Fullscreen
   private frameId = 0;
   private lastTime = performance.now();
   private hudTimer = 0;
+  private autoSaveTimer = 0;
+  private fpsFrames = 0;
+  private fpsAccum = 0;
+  private currentFps = 60;
+  private isFullscreen = false;
   private disposed = false;
   private onHudUpdate: (snap: HudSnapshot) => void;
   private pendingPointerLock = false;
@@ -134,6 +185,7 @@ export class VoxelEngine {
   constructor(container: HTMLElement, onHudUpdate: (snap: HudSnapshot) => void) {
     this.container = container;
     this.onHudUpdate = onHudUpdate;
+    soundEngine.muted = this.settings.muted;
 
     // 1. Software WebGL probe
     this.isSoftwareGl = (() => {
@@ -155,8 +207,11 @@ export class VoxelEngine {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
     this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+    this.renderer.setSize(
+      container.clientWidth || window.innerWidth,
+      container.clientHeight || window.innerHeight,
+    );
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && this.settings.shadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
@@ -166,7 +221,7 @@ export class VoxelEngine {
     // 3. Scene & Studio RoomEnvironment
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x78b4ff);
-    this.scene.fog = new THREE.Fog(0x78b4ff, 26, 56);
+    this.scene.fog = new THREE.Fog(0x78b4ff, 26, 62);
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -174,12 +229,13 @@ export class VoxelEngine {
     pmrem.dispose();
 
     // 4. Camera
-    const aspect = (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight);
-    this.camera = new THREE.PerspectiveCamera(74, aspect, 0.08, 220);
+    const aspect =
+      (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight);
+    this.camera = new THREE.PerspectiveCamera(this.settings.fov, aspect, 0.08, 240);
     this.camera.rotation.order = 'YXZ';
     this.scene.add(this.camera);
 
-    // 5. Procedural Textures & Materials
+    // 5. Procedural Textures & Materials (incl. gentle Water wave shader)
     this.textures = createVoxelTextures(this.renderer.capabilities.getMaxAnisotropy());
     this.opaqueMat = new THREE.MeshStandardMaterial({
       map: this.textures.atlasTexture,
@@ -199,26 +255,59 @@ export class VoxelEngine {
       depthWrite: false,
       side: THREE.DoubleSide,
     });
+    this.waterMat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.waterUniforms.uTime;
+      shader.vertexShader =
+        'uniform float uTime;\n' +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+           float wFrac = fract(position.y);
+           if (wFrac > 0.78 && wFrac < 0.94) {
+             transformed.y += sin(position.x * 1.6 + uTime * 2.5) * 0.04 + cos(position.z * 1.6 + uTime * 2.1) * 0.04;
+           }`,
+        );
+    };
 
-    // 6. World, Sky, Particles, Drops, Mobs
+    // 6. World, Sky, Particles, Footprints, Drops, Projectiles, Mobs
     this.scene.add(this.worldGroup);
-    this.world = new VoxelWorld(this.seed, this.worldGroup, this.opaqueMat, this.waterMat);
-    this.sky = new SkyEnvironment(this.scene, this.isSoftwareGl);
+    this.world = this.createWorldInstance(this.seed);
+    this.sky = new SkyEnvironment(this.scene, this.isSoftwareGl, this.settings.shadows);
     this.particles = new ParticlePool(this.scene);
+    this.footprints = new FootprintPool(this.scene);
     this.drops = new DropManager(this.scene);
+    this.projectiles = new ProjectileManager(this.scene);
     this.mobs = new MobManager(this.scene);
 
-    this.glowLight = new THREE.PointLight(0xffcb6b, 0, 14, 1.5);
+    this.glowLight = new THREE.PointLight(0xffcb6b, 0, 15, 1.5);
     this.scene.add(this.glowLight);
 
-    // 7. Block Selection Wireframe & Crack Mesh
+    // 7. Block Selection Wireframe, Placement Preview Ghost & Crack Mesh
     const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004, 1.004, 1.004));
     this.selectBox = new THREE.LineSegments(
       edges,
-      new THREE.LineBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.8 }),
+      new THREE.LineBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.85 }),
     );
     this.selectBox.visible = false;
     this.scene.add(this.selectBox);
+
+    this.previewGroup = new THREE.Group();
+    const previewFill = new THREE.Mesh(
+      new THREE.BoxGeometry(0.996, 0.996, 0.996),
+      new THREE.MeshBasicMaterial({
+        color: 0x72d5ff,
+        transparent: true,
+        opacity: 0.18,
+        depthWrite: false,
+      }),
+    );
+    const previewWire = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002)),
+      new THREE.LineBasicMaterial({ color: 0x99e6ff, transparent: true, opacity: 0.65 }),
+    );
+    this.previewGroup.add(previewFill, previewWire);
+    this.previewGroup.visible = false;
+    this.scene.add(this.previewGroup);
 
     this.crackMats = this.textures.crackTextures.map(
       (tex) =>
@@ -243,8 +332,8 @@ export class VoxelEngine {
 
     // 9. Spawn & Prebuild World
     this.initStarterInventory('survival');
-    this.spawnPlayerSafe();
-    this.world.prebuildAround(this.playerPos.x, this.playerPos.z, RENDER_RADIUS);
+    this.spawnPlayerSafe(true);
+    this.world.prebuildAround(this.playerPos.x, this.playerPos.z, this.settings.renderDistance);
     this.mobs.spawnInitialMobs(this.world, this.playerPos.x, this.playerPos.z);
     this.rebuildHandModel();
 
@@ -257,13 +346,38 @@ export class VoxelEngine {
     this.startLoop();
   }
 
+  private createWorldInstance(seed: number): VoxelWorld {
+    const w = new VoxelWorld(
+      seed,
+      this.worldGroup,
+      this.opaqueMat,
+      this.waterMat,
+      !this.isSoftwareGl && this.settings.shadows,
+    );
+    w.onSeedChestLoot = (key, items) => {
+      if (!this.chests.has(key)) {
+        this.chests.set(key, items);
+      }
+    };
+    return w;
+  }
+
   public getItemIcons(): Record<number, string> {
     return this.textures.itemIcons;
+  }
+
+  private showToast(msg: string) {
+    this.statusToast = msg;
+    this.statusToastTimer = 2.6;
+    this.emitHud();
   }
 
   private initStarterInventory(mode: GameMode) {
     this.hotbar.fill(null);
     this.inventory.fill(null);
+    this.armor.fill(null);
+    this.offhand = null;
+
     if (mode === 'creative') {
       const starter: ItemId[] = [
         ItemId.Grass,
@@ -272,30 +386,45 @@ export class VoxelEngine {
         ItemId.Cobblestone,
         ItemId.Glass,
         ItemId.Brick,
-        ItemId.Glowstone,
+        ItemId.Lantern,
         ItemId.OakLog,
         ItemId.TNT,
       ];
       starter.forEach((id, i) => {
         this.hotbar[i] = { id, count: 64 };
       });
-    } else {
-      this.hotbar[0] = { id: ItemId.WoodPickaxe, count: 1 };
-      this.hotbar[1] = { id: ItemId.WoodAxe, count: 1 };
+    } else if (mode === 'adventure') {
+      this.hotbar[0] = { id: ItemId.IronSword, count: 1, durability: ITEMS[ItemId.IronSword].maxDurability };
+      this.hotbar[1] = { id: ItemId.Bow, count: 1, durability: ITEMS[ItemId.Bow].maxDurability };
+      this.hotbar[2] = { id: ItemId.Arrow, count: 16 };
+      this.hotbar[3] = { id: ItemId.IronPickaxe, count: 1, durability: ITEMS[ItemId.IronPickaxe].maxDurability };
+      this.hotbar[4] = { id: ItemId.Torch, count: 8 };
+      this.hotbar[5] = { id: ItemId.CookedMeat, count: 6 };
+      this.offhand = { id: ItemId.Shield, count: 1, durability: ITEMS[ItemId.Shield].maxDurability };
+    } else if (mode === 'survival') {
+      this.hotbar[0] = {
+        id: ItemId.WoodPickaxe,
+        count: 1,
+        durability: ITEMS[ItemId.WoodPickaxe].maxDurability,
+      };
+      this.hotbar[1] = {
+        id: ItemId.WoodAxe,
+        count: 1,
+        durability: ITEMS[ItemId.WoodAxe].maxDurability,
+      };
       this.hotbar[2] = { id: ItemId.OakPlanks, count: 16 };
-      this.hotbar[3] = { id: ItemId.Cobblestone, count: 16 };
-      this.hotbar[4] = { id: ItemId.Glowstone, count: 4 };
+      this.hotbar[3] = { id: ItemId.Cobblestone, count: 12 };
+      this.hotbar[4] = { id: ItemId.Torch, count: 6 };
       this.hotbar[5] = { id: ItemId.Apple, count: 4 };
-      this.hotbar[6] = { id: ItemId.TNT, count: 2 };
+      this.hotbar[6] = { id: ItemId.Shield, count: 1, durability: ITEMS[ItemId.Shield].maxDurability };
     }
   }
 
-  private spawnPlayerSafe() {
+  private spawnPlayerSafe(setAsSpawn = false) {
     let bestX = 8.5;
     let bestZ = 8.5;
-    let bestY = this.world.getTerrainHeight(bestX, bestZ) + 1;
-    // Find dry spot above sea level
-    for (let r = 0; r < 24; r += 2) {
+    let bestY = this.world.getTerrainHeight(bestX, bestZ) + 1.05;
+    for (let r = 0; r < 30; r += 2) {
       const y = this.world.getTerrainHeight(8.5 + r, 8.5 + r);
       if (y > SEA_LEVEL + 1) {
         bestX = 8.5 + r;
@@ -305,9 +434,201 @@ export class VoxelEngine {
       }
     }
     this.playerPos.set(bestX, bestY, bestZ);
+    if (setAsSpawn) {
+      this.spawnPoint.copy(this.playerPos);
+    }
     this.playerVel.set(0, 0, 0);
     this.health = this.maxHealth;
     this.hunger = 20;
+    this.air = 20;
+  }
+
+  // ---- Save / Load / Worlds API ----
+  public async getWorldList(): Promise<WorldSaveMeta[]> {
+    return listWorldMetasFromDB();
+  }
+
+  public async saveCurrentWorld(withToast = true): Promise<void> {
+    const payload: WorldSavePayload = {
+      meta: {
+        id: this.worldId,
+        name: this.worldName,
+        seed: this.seed,
+        gameMode: this.gameMode,
+        keepInventory: this.keepInventory,
+        dayCount: this.dayCount,
+        updatedAt: Date.now(),
+      },
+      player: {
+        x: this.playerPos.x,
+        y: this.playerPos.y,
+        z: this.playerPos.z,
+        yaw: this.yaw,
+        pitch: this.pitch,
+        health: this.health,
+        hunger: this.hunger,
+        air: this.air,
+        xpLevel: this.xpLevel,
+        xpProgress: this.xpProgress,
+        isFlying: this.isFlying,
+        spawnX: this.spawnPoint.x,
+        spawnY: this.spawnPoint.y,
+        spawnZ: this.spawnPoint.z,
+        timeOfDay: this.timeOfDay,
+        dayCount: this.dayCount,
+      },
+      hotbar: this.hotbar.map((s) => (s ? { ...s } : null)),
+      inventory: this.inventory.map((s) => (s ? { ...s } : null)),
+      armor: this.armor.map((s) => (s ? { ...s } : null)),
+      offhand: this.offhand ? { ...this.offhand } : null,
+      blockEdits: Array.from(this.world.blockEdits.entries()),
+      blockRotations: Array.from(this.world.blockRotations.entries()),
+      chests: Array.from(this.chests.entries()),
+      furnaces: Array.from(this.furnaces.entries()),
+    };
+    await saveWorldToDB(payload);
+    if (withToast) {
+      this.showToast('Welt gespeichert!');
+    }
+  }
+
+  public async createNewWorld(opts: {
+    name: string;
+    seed?: number;
+    mode: GameMode;
+    keepInventory: boolean;
+  }): Promise<void> {
+    soundEngine.playClick();
+    this.worldId = createWorldId();
+    this.worldName = opts.name.trim() || 'Neue Welt';
+    this.seed = opts.seed || Math.floor(Math.random() * 899999 + 100000);
+    this.gameMode = opts.mode;
+    this.keepInventory = opts.keepInventory;
+    this.isFlying = opts.mode === 'creative' || opts.mode === 'spectator';
+    this.timeOfDay = 0.22;
+    this.dayCount = 1;
+    this.weather = 'clear';
+    this.weatherTimer = 140;
+
+    this.resetWorldObjects();
+    this.world = this.createWorldInstance(this.seed);
+    this.initStarterInventory(opts.mode);
+    this.spawnPlayerSafe(true);
+    this.world.prebuildAround(this.playerPos.x, this.playerPos.z, this.settings.renderDistance);
+    this.mobs.spawnInitialMobs(this.world, this.playerPos.x, this.playerPos.z);
+    this.rebuildHandModel();
+
+    this.screen = 'playing';
+    this.requestPointerLockSafe();
+    await this.saveCurrentWorld(false);
+    this.emitHud();
+  }
+
+  public async loadWorldById(worldId: string): Promise<boolean> {
+    const data = await loadWorldFromDB(worldId);
+    if (!data) return false;
+    soundEngine.playClick();
+
+    this.worldId = data.meta.id;
+    this.worldName = data.meta.name;
+    this.seed = data.meta.seed;
+    this.gameMode = data.meta.gameMode;
+    this.keepInventory = data.meta.keepInventory;
+
+    this.resetWorldObjects();
+    for (const [k, v] of data.chests) this.chests.set(k, v);
+    for (const [k, v] of data.furnaces) this.furnaces.set(k, v);
+
+    this.world = this.createWorldInstance(this.seed);
+    for (const [k, bId] of data.blockEdits) {
+      this.world.blockEdits.set(k, bId as BlockId);
+    }
+    for (const [k, rot] of data.blockRotations) {
+      this.world.blockRotations.set(k, rot);
+    }
+
+    this.playerPos.set(data.player.x, data.player.y, data.player.z);
+    this.spawnPoint.set(data.player.spawnX, data.player.spawnY, data.player.spawnZ);
+    this.yaw = data.player.yaw;
+    this.pitch = data.player.pitch;
+    this.health = data.player.health;
+    this.hunger = data.player.hunger;
+    this.air = data.player.air ?? 20;
+    this.xpLevel = data.player.xpLevel;
+    this.xpProgress = data.player.xpProgress;
+    this.isFlying = data.player.isFlying;
+    this.timeOfDay = data.player.timeOfDay;
+    this.dayCount = data.player.dayCount;
+
+    this.hotbar = data.hotbar;
+    this.inventory = data.inventory;
+    this.armor = data.armor ?? new Array(4).fill(null);
+    this.offhand = data.offhand ?? null;
+
+    this.world.prebuildAround(this.playerPos.x, this.playerPos.z, this.settings.renderDistance);
+    this.mobs.spawnInitialMobs(this.world, this.playerPos.x, this.playerPos.z);
+    this.rebuildHandModel();
+
+    this.screen = 'playing';
+    this.requestPointerLockSafe();
+    this.emitHud();
+    return true;
+  }
+
+  public async deleteWorldById(worldId: string): Promise<void> {
+    await deleteWorldFromDB(worldId);
+  }
+
+  private resetWorldObjects() {
+    this.world.dispose();
+    this.drops.dispose();
+    this.projectiles.clear();
+    this.mobs.clear();
+    this.tntFuses = [];
+    this.furnaces.clear();
+    this.chests.clear();
+    this.activeFurnaceKey = null;
+    this.activeChestKey = null;
+  }
+
+  // ---- Settings & Fullscreen ----
+  public updateSettings(partial: Partial<GameSettings>) {
+    this.settings = { ...this.settings, ...partial };
+    saveSettings(this.settings);
+
+    soundEngine.muted = this.settings.muted;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && this.settings.shadows;
+    this.sky.setShadowsEnabled(this.settings.shadows);
+    this.world.setShadowsEnabled(!this.isSoftwareGl && this.settings.shadows);
+    this.camera.fov = this.settings.fov;
+    this.camera.updateProjectionMatrix();
+
+    if (this.settings.touchControls && document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
+    }
+    this.emitHud();
+  }
+
+  public async toggleFullscreen() {
+    soundEngine.playClick();
+    try {
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element;
+        webkitExitFullscreen?: () => Promise<void>;
+      };
+      const el = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>;
+      };
+      if (!document.fullscreenElement && !doc.webkitFullscreenElement) {
+        if (el.requestFullscreen) await el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+      } else {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (doc.webkitExitFullscreen) await doc.webkitExitFullscreen();
+      }
+    } catch {
+      this.showToast('Vollbild im eingebetteten Fenster blockiert');
+    }
   }
 
   // ---- Public UI Actions ----
@@ -317,7 +638,7 @@ export class VoxelEngine {
       this.initStarterInventory(mode);
     }
     this.gameMode = mode;
-    this.isFlying = mode === 'creative';
+    this.isFlying = mode === 'creative' || mode === 'spectator';
     this.screen = 'playing';
     this.rebuildHandModel();
     this.requestPointerLockSafe();
@@ -326,12 +647,17 @@ export class VoxelEngine {
 
   public resumeGame() {
     soundEngine.playClick();
+    this.activeFurnaceKey = null;
+    this.activeChestKey = null;
     this.screen = 'playing';
     this.requestPointerLockSafe();
     this.emitHud();
   }
 
   public openScreen(next: GameScreen) {
+    if (next === 'title' && this.screen !== 'title') {
+      void this.saveCurrentWorld(false);
+    }
     this.screen = next;
     if (next !== 'playing' && document.pointerLockElement === this.renderer.domElement) {
       document.exitPointerLock();
@@ -339,15 +665,18 @@ export class VoxelEngine {
     this.keys.clear();
     this.mouseLeftDown = false;
     this.mouseRightDown = false;
+    this.touchBlockHeld = false;
     this.emitHud();
   }
 
   public setGameMode(mode: GameMode) {
     soundEngine.playClick();
     this.gameMode = mode;
-    if (mode === 'creative') {
+    if (mode === 'creative' || mode === 'spectator') {
       this.health = this.maxHealth;
       this.hunger = 20;
+      this.air = 20;
+      if (mode === 'spectator') this.isFlying = true;
     } else {
       this.isFlying = false;
     }
@@ -360,25 +689,28 @@ export class VoxelEngine {
     this.emitHud();
   }
 
-  public toggleMute() {
-    soundEngine.muted = !soundEngine.muted;
-    if (!soundEngine.muted) soundEngine.playClick();
+  public setWeather(weather: WeatherType) {
+    soundEngine.playClick();
+    this.weather = weather;
+    this.weatherTimer = 150;
     this.emitHud();
+  }
+
+  public toggleMute() {
+    this.updateSettings({ muted: !this.settings.muted });
+    if (!this.settings.muted) soundEngine.playClick();
   }
 
   public toggleTouchControls() {
     soundEngine.playClick();
-    this.touchControls = !this.touchControls;
     this.touchMoveX = 0;
     this.touchMoveY = 0;
     this.touchJumpHeld = false;
     this.touchDescendHeld = false;
     this.touchMineHeld = false;
+    this.touchBlockHeld = false;
     this.touchSneak = false;
-    if (this.touchControls && document.pointerLockElement === this.renderer.domElement) {
-      document.exitPointerLock();
-    }
-    this.emitHud();
+    this.updateSettings({ touchControls: !this.settings.touchControls });
   }
 
   public setTouchMove(x: number, y: number) {
@@ -389,7 +721,7 @@ export class VoxelEngine {
   public setTouchJump(held: boolean) {
     if (held && !this.touchJumpHeld) {
       const now = performance.now();
-      if (this.gameMode === 'creative' && now - this.lastSpaceTap < 300) {
+      if ((this.gameMode === 'creative' || this.gameMode === 'spectator') && now - this.lastSpaceTap < 300) {
         this.isFlying = !this.isFlying;
         this.playerVel.y = 0;
         this.emitHud();
@@ -417,34 +749,34 @@ export class VoxelEngine {
     }
   }
 
+  public setTouchBlock(held: boolean) {
+    this.touchBlockHeld = held;
+    this.emitHud();
+  }
+
   public triggerTouchPlace() {
     this.handleSecondaryClick();
   }
 
   public respawnPlayer() {
     soundEngine.playClick();
-    this.spawnPlayerSafe();
+    this.playerPos.copy(this.spawnPoint);
+    this.playerVel.set(0, 0, 0);
+    this.health = this.maxHealth;
+    this.hunger = 20;
+    this.air = 20;
     this.screen = 'playing';
     this.requestPointerLockSafe();
     this.emitHud();
   }
 
   public regenerateWorld(newSeed?: number) {
-    soundEngine.playClick();
-    this.seed = newSeed ?? Math.floor(Math.random() * 899999 + 100000);
-    this.world.dispose();
-    this.drops.dispose();
-    this.mobs.clear();
-    this.tntFuses = [];
-
-    this.world = new VoxelWorld(this.seed, this.worldGroup, this.opaqueMat, this.waterMat);
-    this.initStarterInventory(this.gameMode);
-    this.spawnPlayerSafe();
-    this.world.prebuildAround(this.playerPos.x, this.playerPos.z, RENDER_RADIUS);
-    this.mobs.spawnInitialMobs(this.world, this.playerPos.x, this.playerPos.z);
-    this.screen = 'playing';
-    this.requestPointerLockSafe();
-    this.emitHud();
+    void this.createNewWorld({
+      name: this.worldName,
+      seed: newSeed ?? Math.floor(Math.random() * 899999 + 100000),
+      mode: this.gameMode,
+      keepInventory: this.keepInventory,
+    });
   }
 
   public selectHotbarSlot(index: number) {
@@ -454,38 +786,86 @@ export class VoxelEngine {
     this.emitHud();
   }
 
-  public setSlotItem(area: 'hotbar' | 'inventory', idx: number, stack: ItemStack | null) {
-    if (area === 'hotbar') this.hotbar[idx] = stack ? { ...stack } : null;
-    else this.inventory[idx] = stack ? { ...stack } : null;
+  public setSlotItem(
+    area: 'hotbar' | 'inventory' | 'armor' | 'offhand',
+    idx: number,
+    stack: ItemStack | null,
+  ) {
+    const copy = stack ? { ...stack } : null;
+    if (area === 'hotbar') this.hotbar[idx] = copy;
+    else if (area === 'inventory') this.inventory[idx] = copy;
+    else if (area === 'armor') this.armor[idx] = copy;
+    else this.offhand = copy;
     this.rebuildHandModel();
     this.emitHud();
+  }
+
+  public setFurnaceSlot(slot: 'input' | 'fuel' | 'output', stack: ItemStack | null) {
+    if (!this.activeFurnaceKey) return;
+    const f = this.getOrCreateFurnace(this.activeFurnaceKey);
+    f[slot] = stack ? { ...stack } : null;
+    this.emitHud();
+  }
+
+  public setChestSlot(idx: number, stack: ItemStack | null) {
+    if (!this.activeChestKey) return;
+    const chest = this.getOrCreateChest(this.activeChestKey);
+    chest[idx] = stack ? { ...stack } : null;
+    this.emitHud();
+  }
+
+  public dropActiveItem() {
+    const held = this.hotbar[this.selectedSlot];
+    if (!held) return;
+    this.dropStackFromUi(held);
+    this.hotbar[this.selectedSlot] = null;
+    this.rebuildHandModel();
+    this.emitHud();
+  }
+
+  public dropStackFromUi(stack: ItemStack) {
+    this.camera.getWorldDirection(_lookDir);
+    this.drops.spawnDropWithVel(
+      this.camera.position.x + _lookDir.x * 0.9,
+      this.camera.position.y - 0.15,
+      this.camera.position.z + _lookDir.z * 0.9,
+      { ...stack },
+      _lookDir.x * 4.5,
+      2.2,
+      _lookDir.z * 4.5,
+    );
+    soundEngine.playClick();
   }
 
   public giveCreativeItem(itemId: ItemId) {
     soundEngine.playClick();
     const def = ITEMS[itemId];
     const count = def.maxStack;
-    // Put in selected slot or first empty hotbar slot
+    const stack: ItemStack = {
+      id: itemId,
+      count,
+      durability: def.maxDurability,
+    };
     if (!this.hotbar[this.selectedSlot]) {
-      this.hotbar[this.selectedSlot] = { id: itemId, count };
+      this.hotbar[this.selectedSlot] = stack;
     } else {
       const emptyIdx = this.hotbar.findIndex((s) => s === null);
       if (emptyIdx !== -1) {
-        this.hotbar[emptyIdx] = { id: itemId, count };
+        this.hotbar[emptyIdx] = stack;
         this.selectedSlot = emptyIdx;
       } else {
-        this.hotbar[this.selectedSlot] = { id: itemId, count };
+        this.hotbar[this.selectedSlot] = stack;
       }
     }
     this.rebuildHandModel();
     this.emitHud();
   }
 
-  public addItemToInventory(id: ItemId, count: number): boolean {
-    const maxStack = ITEMS[id]?.maxStack ?? 64;
+  public addItemToInventory(id: ItemId, count: number, durability?: number): boolean {
+    const def = ITEMS[id];
+    const maxStack = def?.maxStack ?? 64;
     let remaining = count;
 
-    // 1. Merge into existing hotbar/inventory stacks
     for (const list of [this.hotbar, this.inventory]) {
       for (let i = 0; i < list.length && remaining > 0; i++) {
         const slot = list[i];
@@ -496,12 +876,15 @@ export class VoxelEngine {
         }
       }
     }
-    // 2. Fill empty slots
     for (const list of [this.hotbar, this.inventory]) {
       for (let i = 0; i < list.length && remaining > 0; i++) {
         if (!list[i]) {
           const add = Math.min(remaining, maxStack);
-          list[i] = { id, count: add };
+          list[i] = {
+            id,
+            count: add,
+            durability: durability ?? def?.maxDurability,
+          };
           remaining -= add;
         }
       }
@@ -537,16 +920,67 @@ export class VoxelEngine {
     return true;
   }
 
+  private getOrCreateFurnace(key: string): FurnaceState {
+    let f = this.furnaces.get(key);
+    if (!f) {
+      f = { input: null, fuel: null, output: null, burnTime: 0, maxBurnTime: 0, cookProgress: 0 };
+      this.furnaces.set(key, f);
+    }
+    return f;
+  }
+
+  private getOrCreateChest(key: string): (ItemStack | null)[] {
+    let c = this.chests.get(key);
+    if (!c) {
+      c = new Array(27).fill(null);
+      this.chests.set(key, c);
+    }
+    return c;
+  }
+
+  private damageHeldTool() {
+    if (this.gameMode === 'creative') return;
+    const held = this.hotbar[this.selectedSlot];
+    if (!held) return;
+    const def = ITEMS[held.id];
+    if (!def.maxDurability) return;
+    const cur = held.durability ?? def.maxDurability;
+    if (cur - 1 <= 0) {
+      this.hotbar[this.selectedSlot] = null;
+      soundEngine.playBreak('wood');
+      this.rebuildHandModel();
+    } else {
+      held.durability = cur - 1;
+    }
+  }
+
+  private getArmorDefense(): number {
+    let sum = 0;
+    for (const a of this.armor) {
+      if (a) sum += ITEMS[a.id]?.armorDefense ?? 0;
+    }
+    return Math.min(20, sum);
+  }
+
+  private isShieldBlocking(): boolean {
+    const held = this.hotbar[this.selectedSlot];
+    const hasShield =
+      this.offhand?.id === ItemId.Shield || held?.id === ItemId.Shield;
+    return hasShield && (this.mouseRightDown || this.touchBlockHeld);
+  }
+
   private requestPointerLockSafe() {
-    if (this.touchControls) return;
+    if (this.settings.touchControls) return;
     this.pendingPointerLock = true;
     try {
-      const res = this.renderer.domElement.requestPointerLock?.() as unknown as Promise<void> | undefined;
+      const res = this.renderer.domElement.requestPointerLock?.() as unknown as
+        | Promise<void>
+        | undefined;
       if (res && typeof res.catch === 'function') {
         res.catch(() => {});
       }
     } catch {
-      // Headless or browser gesture restriction handled gracefully on canvas click
+      // Headless / iframe safe
     }
   }
 
@@ -570,7 +1004,6 @@ export class VoxelEngine {
     }
 
     if (!itemId) {
-      // Bare voxel forearm
       const arm = new THREE.Mesh(
         new THREE.BoxGeometry(0.16, 0.16, 0.45),
         new THREE.MeshStandardMaterial({ color: 0xd19f7b, roughness: 0.78 }),
@@ -582,13 +1015,12 @@ export class VoxelEngine {
 
     const def = ITEMS[itemId];
     if (def.blockId !== undefined) {
-      // Mini 3D block in hand
       const mat = new THREE.MeshStandardMaterial({
         color: def.color,
         roughness: 0.85,
         metalness: 0.05,
-        transparent: def.blockId === BlockId.Glass,
-        opacity: def.blockId === BlockId.Glass ? 0.55 : 1,
+        transparent: def.blockId === BlockId.Glass || def.blockId === BlockId.Ice,
+        opacity: def.blockId === BlockId.Glass || def.blockId === BlockId.Ice ? 0.6 : 1,
       });
       const cube = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.26, 0.26), mat);
       cube.rotation.set(0.15, 0.55, 0);
@@ -596,13 +1028,12 @@ export class VoxelEngine {
       return;
     }
 
-    // Composite Tool / Sword / Resource
     const toolGroup = new THREE.Group();
     const woodMat = new THREE.MeshStandardMaterial({ color: 0x7a5932, roughness: 0.85 });
     const headMat = new THREE.MeshStandardMaterial({
       color: def.color,
       roughness: def.toolKind ? 0.35 : 0.7,
-      metalness: itemId === ItemId.DiamondPickaxe || itemId === ItemId.DiamondSword || itemId === ItemId.IronPickaxe ? 0.65 : 0.1,
+      metalness: (def.toolTier ?? 0) >= 3 ? 0.62 : 0.12,
     });
 
     if (def.toolKind === 'pickaxe') {
@@ -619,6 +1050,14 @@ export class VoxelEngine {
       const blade = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, 0.06), headMat);
       blade.position.set(-0.07, 0.14, 0);
       toolGroup.add(handle, blade);
+    } else if (def.toolKind === 'shovel' || def.toolKind === 'hoe') {
+      const handle = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.42, 0.05), woodMat);
+      const blade = new THREE.Mesh(
+        new THREE.BoxGeometry(def.toolKind === 'hoe' ? 0.18 : 0.13, 0.12, 0.05),
+        headMat,
+      );
+      blade.position.set(def.toolKind === 'hoe' ? -0.06 : 0, 0.2, 0);
+      toolGroup.add(handle, blade);
     } else if (def.toolKind === 'sword') {
       const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.14, 0.05), woodMat);
       const guard = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.04, 0.07), headMat);
@@ -626,6 +1065,18 @@ export class VoxelEngine {
       const blade = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.36, 0.04), headMat);
       blade.position.set(0, 0.28, 0);
       toolGroup.add(grip, guard, blade);
+    } else if (def.toolKind === 'bow' || def.toolKind === 'crossbow') {
+      const limb = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.44, 0.06), woodMat);
+      const str = new THREE.Mesh(
+        new THREE.BoxGeometry(0.02, 0.42, 0.02),
+        new THREE.MeshStandardMaterial({ color: 0xe6e6e6 }),
+      );
+      str.position.set(0, 0, 0.08);
+      toolGroup.add(limb, str);
+    } else if (def.toolKind === 'shield') {
+      const plank = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.44, 0.05), woodMat);
+      const boss = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.16, 0.07), headMat);
+      toolGroup.add(plank, boss);
     } else {
       const gem = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.18), headMat);
       toolGroup.add(gem);
@@ -643,9 +1094,21 @@ export class VoxelEngine {
     this.renderer.setSize(w, h);
   };
 
+  private onFullscreenChange = () => {
+    const doc = document as Document & { webkitFullscreenElement?: Element };
+    this.isFullscreen = Boolean(document.fullscreenElement || doc.webkitFullscreenElement);
+    this.onResize();
+    this.emitHud();
+  };
+
   private onKeyDown = (e: KeyboardEvent) => {
     if (e.code === 'Escape') {
-      if (this.screen === 'inventory' || this.screen === 'crafting') {
+      if (
+        this.screen === 'inventory' ||
+        this.screen === 'crafting' ||
+        this.screen === 'furnace' ||
+        this.screen === 'chest'
+      ) {
         this.resumeGame();
       } else if (this.screen === 'playing') {
         this.openScreen('paused');
@@ -656,7 +1119,7 @@ export class VoxelEngine {
     }
 
     if (this.screen === 'title') {
-      if (e.code === 'Enter' || e.code === 'Space') {
+      if (e.code === 'Enter') {
         e.preventDefault();
         this.startGame('survival');
       }
@@ -666,13 +1129,23 @@ export class VoxelEngine {
     if (e.code === 'KeyE') {
       if (this.screen === 'playing') {
         this.openScreen('inventory');
-      } else if (this.screen === 'inventory' || this.screen === 'crafting') {
+      } else if (
+        this.screen === 'inventory' ||
+        this.screen === 'crafting' ||
+        this.screen === 'furnace' ||
+        this.screen === 'chest'
+      ) {
         this.resumeGame();
       }
       return;
     }
 
     if (this.screen !== 'playing') return;
+
+    if (e.code === 'KeyQ' && !e.repeat) {
+      this.dropActiveItem();
+      return;
+    }
 
     if (e.code === 'F3' || e.code === 'KeyH') {
       e.preventDefault();
@@ -681,17 +1154,11 @@ export class VoxelEngine {
       return;
     }
 
-    if (e.code === 'KeyM') {
-      this.setGameMode(this.gameMode === 'survival' ? 'creative' : 'survival');
-      return;
-    }
-
     if (e.code === 'KeyV') {
       this.toggleMute();
       return;
     }
 
-    // Hotbar 1..9
     if (e.code.startsWith('Digit')) {
       const num = parseInt(e.code.slice(5), 10);
       if (num >= 1 && num <= 9) {
@@ -702,7 +1169,11 @@ export class VoxelEngine {
     if (e.code === 'Space') {
       e.preventDefault();
       const now = performance.now();
-      if (this.gameMode === 'creative' && !e.repeat && now - this.lastSpaceTap < 280) {
+      if (
+        (this.gameMode === 'creative' || this.gameMode === 'spectator') &&
+        !e.repeat &&
+        now - this.lastSpaceTap < 280
+      ) {
         this.isFlying = !this.isFlying;
         this.playerVel.y = 0;
         this.emitHud();
@@ -742,6 +1213,7 @@ export class VoxelEngine {
     this.keys.clear();
     this.mouseLeftDown = false;
     this.mouseRightDown = false;
+    this.touchBlockHeld = false;
     this.isSprinting = false;
     this.touchMoveX = 0;
     this.touchMoveY = 0;
@@ -765,7 +1237,7 @@ export class VoxelEngine {
 
   private onPointerDown = (e: PointerEvent) => {
     if (this.screen !== 'playing') return;
-    if (e.pointerType !== 'touch' && !this.touchControls) return;
+    if (e.pointerType !== 'touch' && !this.settings.touchControls) return;
     if (this.lookPointerId !== null) return;
 
     this.lookPointerId = e.pointerId;
@@ -773,11 +1245,14 @@ export class VoxelEngine {
     this.lookLastY = e.clientY;
     this.lookMovedDist = 0;
 
-    // Long-press still on the 3D scene starts mining
     if (this.touchHoldTimer !== null) window.clearTimeout(this.touchHoldTimer);
     this.touchHoldTimer = window.setTimeout(() => {
       this.touchHoldTimer = null;
-      if (this.lookPointerId === e.pointerId && this.lookMovedDist < 14 && this.screen === 'playing') {
+      if (
+        this.lookPointerId === e.pointerId &&
+        this.lookMovedDist < 14 &&
+        this.screen === 'playing'
+      ) {
         this.touchHoldMining = true;
         this.handlePrimaryClick();
       }
@@ -786,7 +1261,11 @@ export class VoxelEngine {
 
   private onPointerMove = (e: PointerEvent) => {
     if (this.screen !== 'playing') return;
-    if ((e.pointerType !== 'touch' && !this.touchControls) || e.pointerId !== this.lookPointerId) return;
+    if (
+      (e.pointerType !== 'touch' && !this.settings.touchControls) ||
+      e.pointerId !== this.lookPointerId
+    )
+      return;
 
     const dx = e.clientX - this.lookLastX;
     const dy = e.clientY - this.lookLastY;
@@ -799,7 +1278,7 @@ export class VoxelEngine {
       this.touchHoldTimer = null;
     }
 
-    const sensitivity = 0.0042;
+    const sensitivity = 0.0042 * this.settings.sensitivity;
     this.yaw -= dx * sensitivity;
     this.pitch = THREE.MathUtils.clamp(
       this.pitch - dy * sensitivity,
@@ -815,10 +1294,13 @@ export class VoxelEngine {
   };
 
   private onMouseMove = (e: MouseEvent) => {
-    if (this.screen !== 'playing' || this.touchControls) return;
-    if (document.pointerLockElement === this.renderer.domElement || this.mouseLeftDown || this.mouseRightDown) {
-      // Pointer lock delta
-      const sensitivity = 0.0022;
+    if (this.screen !== 'playing' || this.settings.touchControls) return;
+    if (
+      document.pointerLockElement === this.renderer.domElement ||
+      this.mouseLeftDown ||
+      this.mouseRightDown
+    ) {
+      const sensitivity = 0.0022 * this.settings.sensitivity;
       this.yaw -= e.movementX * sensitivity;
       this.pitch = THREE.MathUtils.clamp(
         this.pitch - e.movementY * sensitivity,
@@ -829,9 +1311,7 @@ export class VoxelEngine {
   };
 
   private onMouseDown = (e: MouseEvent) => {
-    if (this.screen !== 'playing' || this.touchControls) return;
-
-    // Ensure pointer lock when clicking canvas in playing state
+    if (this.screen !== 'playing' || this.settings.touchControls) return;
     if (document.pointerLockElement !== this.renderer.domElement) {
       this.requestPointerLockSafe();
     }
@@ -868,12 +1348,11 @@ export class VoxelEngine {
   };
 
   private onPointerLockChange = () => {
-    if (this.touchControls) return;
+    if (this.settings.touchControls) return;
     const locked = document.pointerLockElement === this.renderer.domElement;
     if (locked) {
       this.pendingPointerLock = false;
     } else if (this.screen === 'playing' && !this.pendingPointerLock) {
-      // User pressed Esc or browser unlocked pointer -> pause cleanly
       this.openScreen('paused');
     }
   };
@@ -884,6 +1363,8 @@ export class VoxelEngine {
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onBlur);
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
+    document.addEventListener('fullscreenchange', this.onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', this.onFullscreenChange);
 
     const dom = this.renderer.domElement;
     dom.addEventListener('pointerdown', this.onPointerDown);
@@ -903,6 +1384,8 @@ export class VoxelEngine {
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onBlur);
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
+    document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+    document.removeEventListener('webkitfullscreenchange', this.onFullscreenChange);
 
     const dom = this.renderer.domElement;
     dom.removeEventListener('pointerdown', this.onPointerDown);
@@ -918,19 +1401,18 @@ export class VoxelEngine {
 
   // ---- Interactions ----
   private handlePrimaryClick() {
-    if (this.attackCooldown > 0) return;
+    if (this.gameMode === 'spectator' || this.attackCooldown > 0) return;
     this.swingAnim = 1.0;
 
-    // 1. Check mob hit
     this.camera.getWorldDirection(_lookDir);
     const held = this.hotbar[this.selectedSlot];
     const dmg = held ? ITEMS[held.id].attackDamage ?? 2 : 2;
     if (this.mobs.hitMobNearRay(this.camera.position, _lookDir, dmg, this.drops, this.particles)) {
+      this.damageHeldTool();
       this.attackCooldown = 0.26;
       return;
     }
 
-    // 2. Creative instant break
     if (this.gameMode === 'creative' && this.currentHit) {
       this.breakBlockAt(this.currentHit.bx, this.currentHit.by, this.currentHit.bz, false);
       this.attackCooldown = 0.18;
@@ -938,16 +1420,33 @@ export class VoxelEngine {
   }
 
   private handleSecondaryClick() {
-    if (this.placeCooldown > 0) return;
-
+    if (this.gameMode === 'spectator' || this.placeCooldown > 0) return;
     const held = this.hotbar[this.selectedSlot];
 
-    // 1. Eat food if holding Apple & hungry/hurt in Survival
+    // 1. Bow & Crossbow shooting
+    if (held && (held.id === ItemId.Bow || held.id === ItemId.Crossbow)) {
+      const canShoot = this.gameMode === 'creative' || this.consumeItemCount(ItemId.Arrow, 1);
+      if (canShoot) {
+        this.camera.getWorldDirection(_lookDir);
+        const speed = held.id === ItemId.Crossbow ? 38 : 29;
+        const dmg = ITEMS[held.id].attackDamage ?? 7;
+        this.projectiles.spawnArrow(this.camera.position, _lookDir, speed, dmg, true);
+        soundEngine.playBowShoot();
+        this.damageHeldTool();
+        this.swingAnim = 0.7;
+        this.placeCooldown = held.id === ItemId.Crossbow ? 0.55 : 0.35;
+      } else {
+        this.showToast('Keine Pfeile im Inventar!');
+      }
+      return;
+    }
+
+    // 2. Eat food if hungry or hurt
     if (held && ITEMS[held.id].foodRestore && (this.hunger < 20 || this.health < this.maxHealth)) {
       const restore = ITEMS[held.id].foodRestore ?? 4;
       this.hunger = Math.min(20, this.hunger + restore);
       this.health = Math.min(this.maxHealth, this.health + 2);
-      if (this.gameMode === 'survival') {
+      if (this.gameMode !== 'creative') {
         held.count -= 1;
         if (held.count <= 0) this.hotbar[this.selectedSlot] = null;
       }
@@ -960,36 +1459,90 @@ export class VoxelEngine {
     }
 
     if (!this.currentHit) return;
+    const { bx, by, bz, nx, ny, nz, blockId } = this.currentHit;
+    const key = `${bx},${by},${bz}`;
 
-    // 2. Interact with Crafting Table or TNT (unless sneaking)
-    if (!this.keys.has('ShiftLeft')) {
-      if (this.currentHit.blockId === BlockId.CraftingTable) {
+    // 3. Interact with Crafting Table, Furnace, Chest, Bed, TNT (unless sneaking)
+    if (!this.keys.has('ShiftLeft') && !this.touchSneak) {
+      if (blockId === BlockId.CraftingTable) {
         soundEngine.playClick();
         this.openScreen('crafting');
         return;
       }
-      if (this.currentHit.blockId === BlockId.TNT) {
-        this.igniteTNT(this.currentHit.bx, this.currentHit.by, this.currentHit.bz);
+      if (blockId === BlockId.Furnace) {
+        soundEngine.playClick();
+        this.getOrCreateFurnace(key);
+        this.activeFurnaceKey = key;
+        this.openScreen('furnace');
+        return;
+      }
+      if (blockId === BlockId.Chest) {
+        soundEngine.playClick();
+        this.getOrCreateChest(key);
+        this.activeChestKey = key;
+        this.openScreen('chest');
+        return;
+      }
+      if (blockId === BlockId.Bed) {
+        soundEngine.playClick();
+        this.spawnPoint.set(bx + 0.5, by + 1.1, bz + 0.5);
+        if (this.timeOfDay > 0.46 || this.timeOfDay < 0.03) {
+          this.timeOfDay = 0.04;
+          this.dayCount += 1;
+          this.health = this.maxHealth;
+          this.showToast('Gut geschlafen! Morgen bricht an.');
+        } else {
+          this.showToast('Wiederbelebungspunkt gesetzt!');
+        }
+        this.placeCooldown = 0.35;
+        return;
+      }
+      if (blockId === BlockId.TNT) {
+        this.igniteTNT(bx, by, bz);
         this.placeCooldown = 0.25;
         return;
       }
     }
 
-    // 3. Place block
+    // 4. Hoe tilling Dirt/Grass -> Farmland
+    if (
+      held &&
+      ITEMS[held.id].toolKind === 'hoe' &&
+      (blockId === BlockId.Grass || blockId === BlockId.Dirt)
+    ) {
+      this.world.setBlock(bx, by, bz, BlockId.Farmland);
+      soundEngine.playDig('dirt');
+      this.damageHeldTool();
+      this.swingAnim = 0.8;
+      this.placeCooldown = 0.22;
+      return;
+    }
+
+    // 5. Place block (blocked in Adventure unless creative/survival)
+    if (this.gameMode === 'adventure') return;
     if (!held) return;
     const itemDef = ITEMS[held.id];
     if (itemDef.blockId === undefined) return;
 
-    const px = this.currentHit.bx + this.currentHit.nx;
-    const py = this.currentHit.by + this.currentHit.ny;
-    const pz = this.currentHit.bz + this.currentHit.nz;
+    const px = bx + nx;
+    const py = by + ny;
+    const pz = bz + nz;
     if (py <= 0 || py >= WORLD_HEIGHT) return;
+    if (BLOCKS[itemDef.blockId].solid && this.intersectsPlayerAABB(px, py, pz)) return;
 
-    // Prevent placing inside player's own AABB
-    if (this.intersectsPlayerAABB(px, py, pz)) return;
+    // Facing rotation based on player yaw (0=north, 1=east, 2=south, 3=west)
+    let rot = 0;
+    if (BLOCKS[itemDef.blockId].rotatable) {
+      const deg = (((-this.yaw * 180) / Math.PI) % 360 + 360) % 360;
+      if (deg >= 45 && deg < 135) rot = 3;
+      else if (deg >= 135 && deg < 225) rot = 2;
+      else if (deg >= 225 && deg < 315) rot = 1;
+      else rot = 0;
+    }
 
-    if (this.world.setBlock(px, py, pz, itemDef.blockId)) {
+    if (this.world.setBlock(px, py, pz, itemDef.blockId, rot)) {
       soundEngine.playPlace(BLOCKS[itemDef.blockId].sound);
+      this.particles.spawnBurst(px + 0.5, py + 0.5, pz + 0.5, BLOCKS[itemDef.blockId].particleColor, 5, 1.5);
       this.swingAnim = 0.9;
       this.placeCooldown = 0.2;
 
@@ -1006,7 +1559,8 @@ export class VoxelEngine {
 
   private handlePickBlock() {
     if (!this.currentHit) return;
-    const dropItem = BLOCKS[this.currentHit.blockId]?.dropId ?? (this.currentHit.blockId as unknown as ItemId);
+    const dropItem =
+      BLOCKS[this.currentHit.blockId]?.dropId ?? (this.currentHit.blockId as unknown as ItemId);
     const id = this.currentHit.blockId as unknown as ItemId;
     const pickId = ITEMS[id] ? id : dropItem;
     if (!ITEMS[pickId]) return;
@@ -1039,10 +1593,9 @@ export class VoxelEngine {
     );
     this.cameraShake = Math.min(0.45, Math.max(this.cameraShake, 1.4 / Math.max(1.5, distToPlayer)));
 
-    if (this.gameMode === 'survival' && distToPlayer < radius * 1.8) {
+    if ((this.gameMode === 'survival' || this.gameMode === 'adventure') && distToPlayer < radius * 1.8) {
       const dmg = Math.max(1, Math.round((1 - distToPlayer / (radius * 1.8)) * 12));
       this.applyPlayerDamage(dmg);
-      // Knockback
       const kx = (this.playerPos.x - ex) / Math.max(0.5, distToPlayer);
       const kz = (this.playerPos.z - ez) / Math.max(0.5, distToPlayer);
       this.playerVel.x += kx * 8;
@@ -1062,7 +1615,8 @@ export class VoxelEngine {
           const by = iy + dy;
           const bz = iz + dz;
           const b = this.world.getBlock(bx, by, bz);
-          if (b === BlockId.Air || b === BlockId.Bedrock || b === BlockId.Water) continue;
+          if (b === BlockId.Air || b === BlockId.Bedrock || b === BlockId.Water || b === BlockId.Obsidian)
+            continue;
           this.world.setBlock(bx, by, bz, BlockId.Air);
           if (b === BlockId.TNT) {
             this.tntFuses.push({ x: bx, y: by, z: bz, timer: 0.15 });
@@ -1076,20 +1630,50 @@ export class VoxelEngine {
     const id = this.world.getBlock(bx, by, bz);
     if (id === BlockId.Air || id === BlockId.Bedrock) return;
     const def = BLOCKS[id];
+    const key = `${bx},${by},${bz}`;
+
+    // Drop chest / furnace contents if broken
+    if (id === BlockId.Chest) {
+      const c = this.chests.get(key);
+      if (c) {
+        for (const s of c) {
+          if (s) this.drops.spawnDrop(bx + 0.5, by + 0.5, bz + 0.5, s.id, s.count, s.durability);
+        }
+        this.chests.delete(key);
+      }
+    } else if (id === BlockId.Furnace) {
+      const f = this.furnaces.get(key);
+      if (f) {
+        if (f.input) this.drops.spawnDrop(bx + 0.5, by + 0.5, bz + 0.5, f.input.id, f.input.count);
+        if (f.fuel) this.drops.spawnDrop(bx + 0.5, by + 0.5, bz + 0.5, f.fuel.id, f.fuel.count);
+        if (f.output) this.drops.spawnDrop(bx + 0.5, by + 0.5, bz + 0.5, f.output.id, f.output.count);
+        this.furnaces.delete(key);
+      }
+    }
 
     this.world.setBlock(bx, by, bz, BlockId.Air);
     soundEngine.playBreak(def.sound);
     this.particles.spawnBurst(bx + 0.5, by + 0.5, bz + 0.5, def.particleColor, 16, 3.6);
     this.cameraShake = Math.max(this.cameraShake, 0.022);
-    this.hitstopTimer = 0.028;
+    this.hitstopTimer = 0.025;
 
     if (spawnDrops) {
       const held = this.hotbar[this.selectedSlot];
-      const tool = held ? ITEMS[held.id].toolKind : 'none';
-      const canHarvest = !def.requiresPickaxe || tool === 'pickaxe';
+      const itemDef = held ? ITEMS[held.id] : null;
+      const toolKind = itemDef?.toolKind ?? 'none';
+      const toolTier = itemDef?.toolTier ?? 0;
+
+      const reqTier = def.requiresToolTier ?? 0;
+      const canHarvest =
+        reqTier === 0 || (toolKind === def.preferredTool && toolTier >= reqTier);
+
+      this.damageHeldTool();
+
       if (canHarvest && def.dropId) {
-        // Leaves only drop apples sometimes
-        if (id !== BlockId.Leaves || Math.random() < 0.28) {
+        if (
+          (id !== BlockId.Leaves && id !== BlockId.SpruceLeaves) ||
+          Math.random() < 0.28
+        ) {
           this.drops.spawnDrop(bx + 0.5, by + 0.45, bz + 0.5, def.dropId, def.dropCount ?? 1);
         }
       }
@@ -1108,15 +1692,118 @@ export class VoxelEngine {
     this.crackMesh.visible = false;
   }
 
-  private applyPlayerDamage(amount: number) {
-    if (this.gameMode !== 'survival' || amount <= 0) return;
+  private applyPlayerDamage(rawAmount: number, ignoreShield = false) {
+    if ((this.gameMode !== 'survival' && this.gameMode !== 'adventure') || rawAmount <= 0) return;
+
+    let amount = rawAmount;
+    if (!ignoreShield && this.isShieldBlocking()) {
+      amount = Math.max(0, Math.floor(amount * 0.25));
+      soundEngine.playShieldBlock();
+    }
+
+    const armorDef = this.getArmorDefense();
+    if (armorDef > 0 && amount > 0) {
+      amount = Math.max(1, Math.round(amount * (1 - armorDef * 0.032)));
+      for (let i = 0; i < 4; i++) {
+        const piece = this.armor[i];
+        if (!piece) continue;
+        const maxD = ITEMS[piece.id].maxDurability ?? 100;
+        const cur = (piece.durability ?? maxD) - 1;
+        if (cur <= 0) this.armor[i] = null;
+        else piece.durability = cur;
+      }
+    }
+
+    if (amount <= 0) {
+      this.emitHud();
+      return;
+    }
+
     this.health = Math.max(0, this.health - amount);
     this.cameraShake = Math.max(this.cameraShake, 0.16);
     soundEngine.playHurt();
+
     if (this.health <= 0) {
+      if (!this.keepInventory) {
+        for (let i = 0; i < this.hotbar.length; i++) {
+          const s = this.hotbar[i];
+          if (s) this.drops.spawnDrop(this.playerPos.x, this.playerPos.y + 0.5, this.playerPos.z, s.id, s.count, s.durability);
+          this.hotbar[i] = null;
+        }
+        for (let i = 0; i < this.inventory.length; i++) {
+          const s = this.inventory[i];
+          if (s) this.drops.spawnDrop(this.playerPos.x, this.playerPos.y + 0.5, this.playerPos.z, s.id, s.count, s.durability);
+          this.inventory[i] = null;
+        }
+        for (let i = 0; i < this.armor.length; i++) {
+          const s = this.armor[i];
+          if (s) this.drops.spawnDrop(this.playerPos.x, this.playerPos.y + 0.5, this.playerPos.z, s.id, s.count, s.durability);
+          this.armor[i] = null;
+        }
+        if (this.offhand) {
+          this.drops.spawnDrop(this.playerPos.x, this.playerPos.y + 0.5, this.playerPos.z, this.offhand.id, this.offhand.count, this.offhand.durability);
+          this.offhand = null;
+        }
+        this.rebuildHandModel();
+      }
       this.openScreen('gameover');
     } else {
       this.emitHud();
+    }
+  }
+
+  // ---- Furnace Simulation ----
+  private updateFurnaces(dt: number) {
+    let changed = false;
+    for (const [key, f] of this.furnaces.entries()) {
+      const recipe = f.input ? SMELT_RECIPES.find((r) => r.input === f.input?.id) : null;
+      const canOutput =
+        recipe &&
+        (!f.output ||
+          (f.output.id === recipe.output && f.output.count < (ITEMS[recipe.output]?.maxStack ?? 64)));
+
+      if (f.burnTime > 0) {
+        f.burnTime = Math.max(0, f.burnTime - dt);
+        changed = true;
+      }
+
+      if (recipe && canOutput) {
+        if (f.burnTime <= 0 && f.fuel && f.fuel.count > 0) {
+          const burnDur = getFuelBurnTime(f.fuel.id);
+          if (burnDur > 0) {
+            f.burnTime = burnDur;
+            f.maxBurnTime = burnDur;
+            f.fuel.count -= 1;
+            if (f.fuel.count <= 0) f.fuel = null;
+            changed = true;
+          }
+        }
+        if (f.burnTime > 0) {
+          f.cookProgress += dt / recipe.smeltTime;
+          changed = true;
+          if (f.cookProgress >= 1) {
+            f.cookProgress = 0;
+            if (f.input) {
+              f.input.count -= 1;
+              if (f.input.count <= 0) f.input = null;
+            }
+            if (f.output) {
+              f.output.count += 1;
+            } else {
+              f.output = { id: recipe.output, count: 1 };
+            }
+          }
+        } else {
+          f.cookProgress = Math.max(0, f.cookProgress - dt * 0.5);
+        }
+      } else if (f.cookProgress > 0) {
+        f.cookProgress = 0;
+        changed = true;
+      }
+
+      if (this.activeFurnaceKey === key && changed && this.screen === 'furnace') {
+        // Refreshed on regular hud timer
+      }
     }
   }
 
@@ -1127,6 +1814,7 @@ export class VoxelEngine {
   }
 
   private collidesAABB(px: number, py: number, pz: number): boolean {
+    if (this.gameMode === 'spectator') return false;
     const minX = Math.floor(px - PLAYER_RADIUS);
     const maxX = Math.floor(px + PLAYER_RADIUS);
     const minY = Math.floor(py);
@@ -1158,18 +1846,48 @@ export class VoxelEngine {
   // ---- Main Simulation Tick ----
   private step(rawDt: number) {
     const dt = Math.min(rawDt, 0.05);
+    this.waterUniforms.uTime.value += dt;
+
+    this.fpsFrames += 1;
+    this.fpsAccum += rawDt;
+    if (this.fpsAccum >= 0.5) {
+      this.currentFps = Math.round(this.fpsFrames / this.fpsAccum);
+      this.fpsFrames = 0;
+      this.fpsAccum = 0;
+    }
+
+    if (this.statusToastTimer > 0) {
+      this.statusToastTimer -= dt;
+      if (this.statusToastTimer <= 0) {
+        this.statusToast = null;
+        this.emitHud();
+      }
+    }
 
     if (this.hitstopTimer > 0) {
       this.hitstopTimer -= dt;
       return;
     }
 
-    // Advance Day/Night Cycle slowly (~8 minutes full day)
-    this.timeOfDay += dt * 0.0022;
+    // Advance Day/Night & Weather Cycle
+    this.timeOfDay += dt * 0.002;
     if (this.timeOfDay >= 1) {
       this.timeOfDay -= 1;
       this.dayCount += 1;
     }
+
+    this.weatherTimer -= dt;
+    if (this.weatherTimer <= 0) {
+      this.weatherTimer = 110 + Math.random() * 140;
+      const roll = Math.random();
+      const { biome } = this.world.getBiomeInfo(this.playerPos.x, this.playerPos.z);
+      if (roll < 0.62) this.weather = 'clear';
+      else if (biome === 'snow') this.weather = 'snow';
+      else if (roll < 0.88) this.weather = 'rain';
+      else this.weather = 'storm';
+    }
+
+    const { biome } = this.world.getBiomeInfo(this.playerPos.x, this.playerPos.z);
 
     if (this.screen === 'title') {
       this.titleAngle += dt * 0.12;
@@ -1179,21 +1897,53 @@ export class VoxelEngine {
       const cy = Math.max(24, this.world.getTerrainHeight(cx, cz) + 11);
       this.camera.position.set(cx, cy, cz);
       this.camera.lookAt(8.5, 14, 8.5);
-      this.world.updateChunksAround(this.playerPos.x, this.playerPos.z, RENDER_RADIUS, 3);
-      this.sky.update(this.scene, this.camera.position, this.timeOfDay, dt, false);
-      this.mobs.update(dt, this.world, this.playerPos, 'creative', this.timeOfDay, () => {});
+      this.world.updateChunksAround(
+        this.playerPos.x,
+        this.playerPos.z,
+        this.settings.renderDistance,
+        3,
+      );
+      this.sky.update(
+        this.scene,
+        this.camera.position,
+        this.timeOfDay,
+        dt,
+        false,
+        this.weather,
+        biome,
+        this.settings.weatherParticles,
+        this.settings.renderDistance,
+      );
+      this.mobs.update(
+        dt,
+        this.world,
+        this.playerPos,
+        'creative',
+        this.timeOfDay,
+        this.projectiles,
+        () => {},
+        () => {},
+      );
       this.particles.update(dt);
       this.handGroup.visible = false;
       this.selectBox.visible = false;
+      this.previewGroup.visible = false;
       return;
     }
 
-    this.handGroup.visible = this.screen === 'playing';
+    this.handGroup.visible = this.screen === 'playing' && this.gameMode !== 'spectator';
 
     if (this.screen === 'playing') {
       this.updatePlayer(dt);
       this.updateMining(dt);
+      this.autoSaveTimer += dt;
+      if (this.autoSaveTimer >= 22) {
+        this.autoSaveTimer = 0;
+        void this.saveCurrentWorld(false);
+      }
     }
+
+    this.updateFurnaces(dt);
 
     // Update TNT fuses
     for (let i = this.tntFuses.length - 1; i >= 0; i--) {
@@ -1206,7 +1956,7 @@ export class VoxelEngine {
       }
     }
 
-    // Nearest Glowstone point light
+    // Nearest Glowstone / Torch / Lantern / Lava point light
     let nearestDist = 256;
     let nearestGlow: THREE.Vector3 | null = null;
     for (const gp of this.world.glowstones.values()) {
@@ -1223,16 +1973,63 @@ export class VoxelEngine {
       this.glowLight.intensity = 0;
     }
 
-    this.world.updateChunksAround(this.playerPos.x, this.playerPos.z, RENDER_RADIUS, 3);
-    this.sky.update(this.scene, this.playerPos, this.timeOfDay, dt, this.isUnderwater);
+    this.world.updateChunksAround(
+      this.playerPos.x,
+      this.playerPos.z,
+      this.settings.renderDistance,
+      3,
+    );
+    this.sky.update(
+      this.scene,
+      this.playerPos,
+      this.timeOfDay,
+      dt,
+      this.isUnderwater,
+      this.weather,
+      biome,
+      this.settings.weatherParticles,
+      this.settings.renderDistance,
+    );
     this.particles.update(dt);
-    this.drops.update(dt, this.world, this.playerPos, (id, cnt) => this.addItemToInventory(id, cnt));
-    this.mobs.update(dt, this.world, this.playerPos, this.gameMode, this.timeOfDay, (x, y, z, r) =>
-      this.triggerExplosion(x, y, z, r),
+    this.footprints.update(dt);
+    this.drops.update(
+      dt,
+      this.world,
+      this.playerPos,
+      this.gameMode !== 'spectator',
+      (stack) => this.addItemToInventory(stack.id, stack.count, stack.durability),
+    );
+    this.projectiles.update(
+      dt,
+      this.world,
+      this.mobs,
+      this.drops,
+      this.particles,
+      this.playerPos,
+      (dmg, dx, dz) => {
+        this.applyPlayerDamage(dmg);
+        this.playerVel.x += dx * 4.5;
+        this.playerVel.z += dz * 4.5;
+      },
+    );
+    this.mobs.update(
+      dt,
+      this.world,
+      this.playerPos,
+      this.gameMode,
+      this.timeOfDay,
+      this.projectiles,
+      (x, y, z, r) => this.triggerExplosion(x, y, z, r),
+      (dmg, dx, dz) => {
+        this.applyPlayerDamage(dmg);
+        this.playerVel.x += dx * 5;
+        this.playerVel.z += dz * 5;
+        this.playerVel.y = Math.max(this.playerVel.y, 3.2);
+      },
     );
 
     this.hudTimer += dt;
-    if (this.hudTimer >= 0.12) {
+    if (this.hudTimer >= 0.14) {
       this.hudTimer = 0;
       this.emitHud();
     }
@@ -1242,7 +2039,6 @@ export class VoxelEngine {
     if (this.attackCooldown > 0) this.attackCooldown -= dt;
     if (this.placeCooldown > 0) this.placeCooldown -= dt;
 
-    // Water check
     const headBlock = this.world.getBlock(
       this.playerPos.x,
       this.playerPos.y + EYE_HEIGHT,
@@ -1250,13 +2046,43 @@ export class VoxelEngine {
     );
     const feetBlock = this.world.getBlock(this.playerPos.x, this.playerPos.y + 0.2, this.playerPos.z);
     const wasUnderwater = this.isUnderwater;
-    this.isUnderwater = headBlock === BlockId.Water;
-    const inWater = feetBlock === BlockId.Water || this.isUnderwater;
+    this.isUnderwater = headBlock === BlockId.Water && this.gameMode !== 'spectator';
+    const inWater = (feetBlock === BlockId.Water || this.isUnderwater) && this.gameMode !== 'spectator';
+    const inLava = (feetBlock === BlockId.Lava || headBlock === BlockId.Lava) && this.gameMode !== 'spectator';
     if (!wasUnderwater && this.isUnderwater) {
       soundEngine.playSplash();
     }
 
-    // Movement basis from yaw (keyboard + analog touch stick)
+    // Drowning & Lava & Cactus survival hazards
+    if (this.gameMode === 'survival' || this.gameMode === 'adventure') {
+      if (this.isUnderwater) {
+        this.airTimer += dt;
+        if (this.airTimer >= 0.75) {
+          this.airTimer = 0;
+          if (this.air > 0) {
+            this.air = Math.max(0, this.air - 2);
+          } else {
+            this.applyPlayerDamage(2, true);
+          }
+        }
+      } else {
+        this.air = Math.min(20, this.air + dt * 6);
+        this.airTimer = 0;
+      }
+
+      if (inLava) {
+        this.lavaTimer += dt;
+        if (this.lavaTimer >= 0.55) {
+          this.lavaTimer = 0;
+          soundEngine.playSizzle();
+          this.particles.spawnBurst(this.playerPos.x, this.playerPos.y + 0.7, this.playerPos.z, 0xff6b1a, 8, 2.5);
+          this.applyPlayerDamage(4, true);
+        }
+      } else {
+        this.lavaTimer = 0.5;
+      }
+    }
+
     const sinY = Math.sin(this.yaw);
     const cosY = Math.cos(this.yaw);
     let moveForward = this.touchMoveY;
@@ -1272,15 +2098,15 @@ export class VoxelEngine {
 
     const touchSprint = this.touchMoveY > 0.86;
     const isSneaking = (this.keys.has('ShiftLeft') || this.touchSneak) && !this.isFlying;
-    const sprintingNow = this.isSprinting || touchSprint;
+    const sprintingNow = (this.isSprinting || touchSprint) && !this.isShieldBlocking();
     const targetSpeed = this.isFlying
       ? sprintingNow
-        ? 14.5
-        : 9.2
-      : isSneaking
+        ? 15.5
+        : 9.8
+      : isSneaking || this.isShieldBlocking()
         ? 2.6
         : sprintingNow && moveForward > 0
-          ? 6.9
+          ? 7.0
           : inWater
             ? 3.2
             : 4.8;
@@ -1289,14 +2115,13 @@ export class VoxelEngine {
     this.playerVel.x = THREE.MathUtils.damp(this.playerVel.x, _vec3A.x * targetSpeed, accel, dt);
     this.playerVel.z = THREE.MathUtils.damp(this.playerVel.z, _vec3A.z * targetSpeed, accel, dt);
 
-    // Vertical physics (Fly vs Water vs Gravity)
     const jumpHeld = this.keys.has('Space') || this.touchJumpHeld;
     const descendHeld = this.keys.has('ShiftLeft') || this.touchDescendHeld;
 
-    if (this.isFlying) {
+    if (this.isFlying || this.gameMode === 'spectator') {
       let vy = 0;
-      if (jumpHeld) vy += 8.0;
-      if (descendHeld) vy -= 8.0;
+      if (jumpHeld) vy += 8.5;
+      if (descendHeld) vy -= 8.5;
       this.playerVel.y = THREE.MathUtils.damp(this.playerVel.y, vy, 12, dt);
     } else if (inWater) {
       this.playerVel.y -= 8.0 * dt;
@@ -1319,7 +2144,6 @@ export class VoxelEngine {
       }
     }
 
-    // Separate X, Z, Y axis sweep collisions (with Sneak edge guard)
     const dx = this.playerVel.x * dt;
     if (!this.collidesAABB(this.playerPos.x + dx, this.playerPos.y, this.playerPos.z)) {
       if (
@@ -1359,7 +2183,6 @@ export class VoxelEngine {
       if (dy < 0) {
         this.playerPos.y = Math.floor(this.playerPos.y + dy) + 1.0001;
         this.onGround = true;
-        // Fall damage in Survival
         if (prevVy < -12.5 && !inWater && !this.isFlying) {
           const dmg = Math.floor((-prevVy - 11.5) * 1.15);
           this.applyPlayerDamage(dmg);
@@ -1368,34 +2191,52 @@ export class VoxelEngine {
       this.playerVel.y = 0;
     }
 
-    // Prevent falling below void
     if (this.playerPos.y < -8) {
-      this.spawnPlayerSafe();
+      this.spawnPlayerSafe(false);
     }
 
-    // Hunger tick in Survival
-    if (this.gameMode === 'survival') {
-      this.hungerTimer += dt * (this.isSprinting ? 2.2 : 1.0);
+    if (this.gameMode === 'survival' || this.gameMode === 'adventure') {
+      this.hungerTimer += dt * (sprintingNow ? 2.2 : 1.0);
       if (this.hungerTimer >= 16) {
         this.hungerTimer = 0;
         if (this.hunger > 0) this.hunger -= 1;
-        else this.applyPlayerDamage(1);
+        else this.applyPlayerDamage(1, true);
       }
       if (this.hunger >= 18 && this.health < this.maxHealth && Math.random() < dt * 0.25) {
         this.health = Math.min(this.maxHealth, this.health + 1);
       }
     }
 
-    // Walk bobbing & footsteps
+    // Walk bobbing, footsteps & visible footprints
     const horizSpeed = Math.hypot(this.playerVel.x, this.playerVel.z);
-    if (this.onGround && horizSpeed > 0.4) {
+    if (this.onGround && horizSpeed > 0.4 && this.gameMode !== 'spectator') {
       this.walkBob += dt * horizSpeed * 2.1;
       this.stepDist += horizSpeed * dt;
-      if (this.stepDist > 1.75) {
+      if (this.stepDist > 1.45) {
         this.stepDist = 0;
-        const groundBlock = this.world.getBlock(this.playerPos.x, this.playerPos.y - 0.15, this.playerPos.z);
+        const groundBlock = this.world.getBlock(
+          this.playerPos.x,
+          this.playerPos.y - 0.15,
+          this.playerPos.z,
+        );
         if (groundBlock !== BlockId.Air) {
           soundEngine.playStep(BLOCKS[groundBlock].sound);
+          if (
+            groundBlock === BlockId.Grass ||
+            groundBlock === BlockId.Dirt ||
+            groundBlock === BlockId.Sand ||
+            groundBlock === BlockId.Snow ||
+            groundBlock === BlockId.Gravel
+          ) {
+            this.footprints.spawnFootprint(
+              this.playerPos.x,
+              Math.floor(this.playerPos.y - 0.15) + 1,
+              this.playerPos.z,
+              this.yaw,
+              this.leftFootNext,
+            );
+            this.leftFootNext = !this.leftFootNext;
+          }
         }
       }
     } else {
@@ -1403,7 +2244,8 @@ export class VoxelEngine {
     }
 
     // Camera FOV & Shake
-    const targetFov = this.isSprinting && horizSpeed > 3 ? 82 : 74;
+    const baseFov = this.settings.fov;
+    const targetFov = sprintingNow && horizSpeed > 3 ? baseFov + 8 : baseFov;
     if (Math.abs(this.camera.fov - targetFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 10, dt);
       this.camera.updateProjectionMatrix();
@@ -1422,19 +2264,27 @@ export class VoxelEngine {
     );
     this.camera.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
 
-    // Hand swing animation
+    // Hand swing + shield raise pose
     if (this.swingAnim > 0) {
       this.swingAnim = Math.max(0, this.swingAnim - dt * 5.2);
     }
     const swing = Math.sin(this.swingAnim * Math.PI);
+    const blockLift = this.isShieldBlocking() ? 0.16 : 0;
     this.handGroup.position.set(
-      0.42 - swing * 0.14,
-      -0.34 + bobOffset * 0.45 - swing * 0.08,
+      0.42 - swing * 0.14 - blockLift,
+      -0.34 + bobOffset * 0.45 - swing * 0.08 + blockLift * 0.5,
       -0.58 - swing * 0.18,
     );
-    this.handGroup.rotation.set(-swing * 0.85, swing * 0.25, swing * 0.3);
+    this.handGroup.rotation.set(-swing * 0.85, swing * 0.25 + blockLift * 1.4, swing * 0.3);
 
-    // Raycast targeted block
+    // Raycast targeted block & update placement preview ghost
+    if (this.gameMode === 'spectator') {
+      this.currentHit = null;
+      this.selectBox.visible = false;
+      this.previewGroup.visible = false;
+      return;
+    }
+
     this.camera.getWorldDirection(_lookDir);
     this.currentHit = this.world.raycast(this.camera.position, _lookDir, 5.5);
     if (this.currentHit) {
@@ -1444,14 +2294,38 @@ export class VoxelEngine {
         this.currentHit.by + 0.5,
         this.currentHit.bz + 0.5,
       );
+
+      const held = this.hotbar[this.selectedSlot];
+      const itemDef = held ? ITEMS[held.id] : null;
+      const px = this.currentHit.bx + this.currentHit.nx;
+      const py = this.currentHit.by + this.currentHit.ny;
+      const pz = this.currentHit.bz + this.currentHit.nz;
+      const canShowPreview =
+        this.gameMode !== 'adventure' &&
+        itemDef?.blockId !== undefined &&
+        py > 0 &&
+        py < WORLD_HEIGHT &&
+        (!BLOCKS[itemDef.blockId].solid || !this.intersectsPlayerAABB(px, py, pz));
+
+      if (canShowPreview) {
+        this.previewGroup.visible = true;
+        this.previewGroup.position.set(px + 0.5, py + 0.5, pz + 0.5);
+      } else {
+        this.previewGroup.visible = false;
+      }
     } else {
       this.selectBox.visible = false;
+      this.previewGroup.visible = false;
     }
   }
 
   private updateMining(dt: number) {
     const isMiningHeld = this.mouseLeftDown || this.touchMineHeld || this.touchHoldMining;
-    if (!isMiningHeld || this.gameMode !== 'survival' || !this.currentHit) {
+    if (
+      !isMiningHeld ||
+      (this.gameMode !== 'survival' && this.gameMode !== 'adventure') ||
+      !this.currentHit
+    ) {
       if (!isMiningHeld) this.resetMining();
       return;
     }
@@ -1459,6 +2333,18 @@ export class VoxelEngine {
     const { bx, by, bz, blockId } = this.currentHit;
     const def = BLOCKS[blockId];
     if (def.hardness < 0) {
+      this.resetMining();
+      return;
+    }
+
+    const held = this.hotbar[this.selectedSlot];
+    const itemDef = held ? ITEMS[held.id] : null;
+
+    // Adventure mode requires matching preferred tool!
+    if (
+      this.gameMode === 'adventure' &&
+      (def.preferredTool === 'none' || itemDef?.toolKind !== def.preferredTool)
+    ) {
       this.resetMining();
       return;
     }
@@ -1473,14 +2359,11 @@ export class VoxelEngine {
       this.miningProgress = 0;
     }
 
-    // Calculate speed multiplier from held tool
-    const held = this.hotbar[this.selectedSlot];
-    const itemDef = held ? ITEMS[held.id] : null;
     let mult = 1.0;
     if (itemDef && itemDef.toolKind === def.preferredTool) {
-      mult = itemDef.miningMultiplier ?? 1.5;
-    } else if (def.requiresPickaxe && (!itemDef || itemDef.toolKind !== 'pickaxe')) {
-      mult = 0.35; // Very slow bare-handed stone mining
+      mult = itemDef.miningMultiplier ?? 1.8;
+    } else if ((def.requiresToolTier ?? 0) > 0) {
+      mult = 0.3;
     }
 
     this.miningProgress += (dt * mult) / def.hardness;
@@ -1505,19 +2388,32 @@ export class VoxelEngine {
   }
 
   private emitHud() {
+    const { biome } = this.world.getBiomeInfo(this.playerPos.x, this.playerPos.z);
+    const temp = this.world.getTemperatureC(this.playerPos.x, this.playerPos.y, this.playerPos.z);
+
     this.onHudUpdate({
       screen: this.screen,
       gameMode: this.gameMode,
+      keepInventory: this.keepInventory,
+      worldId: this.worldId,
+      worldName: this.worldName,
       health: this.health,
       maxHealth: this.maxHealth,
       hunger: this.hunger,
+      air: Math.round(this.air),
+      armorDefense: this.getArmorDefense(),
       xpLevel: this.xpLevel,
       xpProgress: this.xpProgress,
       hotbar: this.hotbar.map((s) => (s ? { ...s } : null)),
       inventory: this.inventory.map((s) => (s ? { ...s } : null)),
+      armor: this.armor.map((s) => (s ? { ...s } : null)),
+      offhand: this.offhand ? { ...this.offhand } : null,
       selectedSlot: this.selectedSlot,
       timeOfDay: this.timeOfDay,
       dayCount: this.dayCount,
+      biome,
+      weather: this.weather,
+      temperatureC: temp,
       coords: {
         x: Math.floor(this.playerPos.x),
         y: Math.floor(this.playerPos.y),
@@ -1527,10 +2423,32 @@ export class VoxelEngine {
       breakProgress: this.miningProgress,
       isUnderwater: this.isUnderwater,
       isFlying: this.isFlying,
-      muted: soundEngine.muted,
+      isBlocking: this.isShieldBlocking(),
+      fps: this.currentFps,
       showDebug: this.showDebug,
-      touchControls: this.touchControls,
+      settings: { ...this.settings },
       seed: this.seed,
+      activeFurnaceKey: this.activeFurnaceKey,
+      activeFurnace: this.activeFurnaceKey
+        ? {
+            ...(this.furnaces.get(this.activeFurnaceKey) ?? {
+              input: null,
+              fuel: null,
+              output: null,
+              burnTime: 0,
+              maxBurnTime: 0,
+              cookProgress: 0,
+            }),
+          }
+        : null,
+      activeChestKey: this.activeChestKey,
+      activeChestSlots: this.activeChestKey
+        ? (this.chests.get(this.activeChestKey) ?? new Array(27).fill(null)).map((s) =>
+            s ? { ...s } : null,
+          )
+        : [],
+      statusToast: this.statusToast,
+      isFullscreen: this.isFullscreen,
     });
   }
 
@@ -1586,7 +2504,9 @@ export class VoxelEngine {
     this.world.dispose();
     this.sky.dispose();
     this.particles.dispose();
+    this.footprints.dispose();
     this.drops.dispose();
+    this.projectiles.dispose();
     this.mobs.clear();
 
     this.opaqueMat.dispose();
@@ -1597,6 +2517,12 @@ export class VoxelEngine {
     this.crackMesh.geometry.dispose();
     this.selectBox.geometry.dispose();
     (this.selectBox.material as THREE.Material).dispose();
+    this.previewGroup.traverse((c) => {
+      if (c instanceof THREE.Mesh || c instanceof THREE.LineSegments) {
+        c.geometry.dispose();
+        (c.material as THREE.Material).dispose();
+      }
+    });
 
     this.renderer.dispose();
     if (this.renderer.domElement.parentNode === this.container) {
@@ -1604,6 +2530,3 @@ export class VoxelEngine {
     }
   }
 }
-
-// Unused vector suppression for clean TS
-void _vec3B;
